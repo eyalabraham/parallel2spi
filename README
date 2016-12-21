@@ -1,0 +1,66 @@
+ 
+ par2spi.c
+
+ATmega328p AVR used as parallel<-->serial SPI to interface.
+FlashLite v25 CPU board with Ethernet, LCD and/or SD Card (built into LCD).
+The Flashlite-V25 is a single board computer based on the NEC V-25 Plus micro-controller.
+The V-25 is a 16-bit, single-chip micro-controller that is software compatible with the Intel 8086/8088 family of microprocessors.
+It comes with embedded DOS and utility software on the on-board flash disk.
+This is a very simple implementation with no interrupt handling, per byte read and write operation only.
+AVR is used as a smart hand-shake capable shift register, with the interrupt handling done by the v25 CPU.
+The v25 can use the RDY (AVR-PB6 to v25-INTP0) line as an interrupt input to drive bulk transfers etc.
+ 
+ 
+    connectivity schema:
+
+  AVR                                             FlashLite NEC V25
+=========                                      ======================
+
+                                            J5
+                                        ------------------------------------------------
+                                          Port 1: PMC1=0x00, PM1=0x00
+                                          Port 2: PMC2=0x00, PM2=0x00 (out) / 0xff (in)
+
+ PB6    <----------*-------------------< ^RD/WR        P1.4
+                   |
+ PB7    >----------------*-------------> ^RDY          P1.1 (INTP0)
+                   |     |
+               +--------( )---+
+               |  DIR   OE^   |
+               |              |
+               |   74LS245    |
+               |              |
+ PD0..7 <----->| [B]      [A] |<------->               Data in/out     P2.0 .. P2.7
+               |              |
+               |              |
+               +--------------+
+
+ PB0    <------------------------------< STB           P1.5
+
+ PC0    <------------------------------< FSEL0 (LCD)   P1.6
+ PC1    <------------------------------< FSEL1 (Ether) P1.7
+        
+        
+ name:  FSEL1       FSEL0       LCD-CS^     LCD-D/C^    ETH-CS^
+ v25 :   P1.7        P1.6
+ AVR :   PC1         PC0         PC4         PC3         PC5
+     ----------   ---------   ----------  ----------  ----------
+          0           0           1           1           0         - Ethernet select
+          0           1           0           0           1         - LCD select command
+          1           0           0           1           1         - LCD select data
+          1           1           1           1           1         - nothing selected (maybe use for SD card CS?)
+
+        write to device timing                  read from device timing
+    ---------------------------------       ---------------------------------
+
+    SSn^    `````\......../```````          SSn^    `````\......../```````
+    
+    RD/WR^  `````\......../```````          RD/WR^  ``````````````````````
+    
+    Data    -----<XXXXXXXX>-------          Data    --------<XXXXXXXX>----
+    
+    STB     ```````\...../````````          STB     `````\......./````````
+    
+    RDY^    `````````\.../````````          RDY^    `````````\.../````````
+
+

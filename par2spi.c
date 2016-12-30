@@ -20,24 +20,24 @@
  *                                           Port 1: PMC1=0x00, PM1=0x00
  *                                           Port 2: PMC2=0x00, PM2=0x00 (out) / 0xff (in)
  * 
- *  PB6    <----------*-------------------< ^RD/WR        P1.4
+ *  PB6    <----------*-------------------< ^RD/WR P1.4
  *                    |
- *  PB7    >----------------*-------------> ^RDY          P1.1 (INTP0)
+ *  PB7    >----------------*-------------> ^RDY   P1.1 (INTP0)
  *                    |     |
  *                +--------( )---+
  *                |  DIR   OE^   |
  *                |              |
  *                |   74LS245    |
  *                |              |
- *  PD0..7 <----->| [B]      [A] |<------->               Data in/out     P2.0 .. P2.7
+ *  PD0..7 <----->| [B]      [A] |<------->        Data in/out     P2.0 .. P2.7
  *                |              |
  *                |              |
  *                +--------------+
  * 
- *  PB0    <------------------------------< STB           P1.5
+ *  PB0    <------------------------------< STB    P1.5
  * 
- *  PC0    <------------------------------< FSEL0 (LCD)   P1.6
- *  PC1    <------------------------------< FSEL1 (Ether) P1.7
+ *  PC0    <------------------------------< FSEL0  P1.6
+ *  PC1    <------------------------------< FSEL1  P1.7
  *         
  *         
  *  name:  FSEL1       FSEL0      ETH-CS^    LCD-CS^     LCD-D/C^
@@ -217,19 +217,18 @@ int main(void)
                 SPDR = DUMMY_WR;        // send a dummy byte
                 while ( ~(SPSR & TX_DONE) ) {}; // wait for transmission to complete
                 PORTD = SPDR;           // transfer the data byte to v25
+                PORTB ^= TOGG_RDY;      // assert RDY to v25
             }
             else
             {
-                SPDR = PIND;            // place data from v25 to transmit to slave
+                PORTB ^= TOGG_RDY;      // assert RDY to v25, also enabling tri-state buffer
+                SPDR = PIND;            // read data from v25 and transmit to slave
                 while ( ~(SPSR & TX_DONE) ) {}; // wait for transmission to complete
             }
- 
-            // assert RDY to v25
-            PORTB ^= TOGG_RDY;
 
             // wait for v25 to un-assert strobe before un-asserting RDY *** potential lock up ***
             while ( ~(PINB & V25_STROBE) ) {};
-            PORTB ^= TOGG_RDY;
+            PORTB ^= TOGG_RDY;          // *** to prevent race a condition, v25 should wait until RDY is un-asserted before continuing ***
         }
 
         // un-assert all CS lines

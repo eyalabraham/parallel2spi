@@ -1,8 +1,7 @@
  
  par2spi.c
 
-ATmega328p AVR used as parallel<-->serial SPI to interface.
-FlashLite v25 CPU board with Ethernet, LCD and/or SD Card (built into LCD).
+ATmega328p AVR used as parallel<-->serial SPI to interface the FlashLite v25 CPU board with Ethernet, LCD and/or SD Card (built into LCD).
 The Flashlite-V25 is a single board computer based on the NEC V-25 Plus micro-controller.
 The V-25 is a 16-bit, single-chip micro-controller that is software compatible with the Intel 8086/8088 family of microprocessors.
 It comes with embedded DOS and utility software on the on-board flash disk.
@@ -21,24 +20,24 @@ The v25 can use the RDY (AVR-PB6 to v25-INTP0) line as an interrupt input to dri
                                           Port 1: PMC1=0x00, PM1=0x00
                                           Port 2: PMC2=0x00, PM2=0x00 (out) / 0xff (in)
 
- PB6    <----------*-------------------< ^RD/WR        P1.4
+ PB6    <----------*-------------------< ^RD/WR P1.4
                    |
- PB7    >----------------*-------------> ^RDY          P1.1 (INTP0)
+ PB7    >----------------*-------------> ^RDY   P1.1 (INTP0)
                    |     |
                +--------( )---+
                |  DIR   OE^   |
                |              |
                |   74LS245    |
                |              |
- PD0..7 <----->| [B]      [A] |<------->               Data in/out     P2.0 .. P2.7
+ PD0..7 <----->| [B]      [A] |<------->        Data in/out     P2.0 .. P2.7
                |              |
                |              |
                +--------------+
 
- PB0    <------------------------------< STB           P1.5
+ PB0    <------------------------------< STB    P1.5
 
- PC0    <------------------------------< FSEL0 (LCD)   P1.6
- PC1    <------------------------------< FSEL1 (Ether) P1.7
+ PC0    <------------------------------< FSEL0  P1.6
+ PC1    <------------------------------< FSEL1  P1.7
         
         
  name:  FSEL1       FSEL0       LCD-CS^     LCD-D/C^    ETH-CS^

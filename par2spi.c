@@ -8,60 +8,49 @@
  * it comes with embedded DOS and utility software on the on-board flash disk.
  * this is a very simple implementation with no interrupt handling, per byte read and write operation only
  * AVR is used as a smart hand-shake capable shift register, with the interrupt handling done by the v25 CPU
- * v25 can use the RDY (AVR-PB6 to v25-INTP0) line as an interrupt input to drive bulk transfers etc.
- * 
- *     connectivity schema:
- * 
- *   AVR                                             FlashLite NEC V25
- * =========                                      ======================
- * 
- *                                             J5
- *                                         ------------------------------------------------
- *                                           Port 1: PMC1=0x00, PM1=0x00
- *                                           Port 2: PMC2=0x00, PM2=0x00 (out) / 0xff (in)
- * 
- *  PB6    <----------*-------------------< ^RD/WR P1.4
- *                    |
- *  PB7    >----------------*-------------> ^RDY   P1.1 (INTP0)
- *                    |     |
- *                +--------( )---+
- *                |  DIR   OE^   |
- *                |              |
- *                |   74LS245    |
- *                |              |
- *  PD0..7 <----->| [B]      [A] |<------->        Data in/out     P2.0 .. P2.7
- *                |              |
- *                |              |
- *                +--------------+
- * 
- *  PB0    <------------------------------< STB    P1.5
- * 
- *  PC0    <------------------------------< FSEL0  P1.6
- *  PC1    <------------------------------< FSEL1  P1.7
- *         
- *         
- *  name:  FSEL1       FSEL0      ETH-CS^    LCD-CS^     LCD-D/C^
- *  v25 :   P1.7        P1.6
- *  AVR :   PC1         PC0         PC5        PC4         PC3
- *      ----------   ---------  ----------  ----------  ----------
- *           0           0           0          1           1         - Ethernet select
- *           0           1           1          0           0         - LCD select command
- *           1           0           1          0           1         - LCD select data
- *           1           1           1          1           1         - nothing selected (maybe use for SD card CS?)
- * 
- *         write to device timing                  read from device timing
- *     ---------------------------------       ---------------------------------
- * 
- *     SSn^    `````\......../```````          SSn^    `````\......../```````
- *     
- *     RD/WR^  `````\......../```````          RD/WR^  ``````````````````````
- *     
- *     Data    -----<XXXXXXXX>-------          Data    --------<XXXXXXXX>----
- *     
- *     STB     ```````\...../````````          STB     `````\......./````````
- *     
- *     RDY^    `````````\..../```````          RDY^    `````````\..../```````
- * 
+ * v25 uses a 82C55 PIO with PortA in Mode-2, with automatic hand shake signal generation and interrupt line to v25.
+ *
+ *     connectivity schema for v25 with 8255 and AVR:
+ *
+ *     v25 CPU bus                     8255                    AVR
+ * ===================       ==========================    ===========
+ *
+ *                 +-------------------+   IO addresses
+ *                 |                   |  --------------
+ *                 |       8255*       |   PA   0xXXX0
+ *                 |                   |   PB   0xXXX1
+ * INTP0** <-------| PC3               |   PC   0xXXX2
+ * (P1.1)          |                   |   Ctrl 0xXXX3
+ *                 |                   |
+ * IORD^   ------->| RD^      PA0..PA7 |<------------>    PD0..PD7  Data
+ *                 |               PC4 |<-------------    PB0       STB^ (AVR strobe data into 8255)
+ * IOWR^   ------->| WR^           PC5 |------------->    PB1       IBF  (8255 latched data, not ready = '1', ready or data read by CPU = '0')
+ *                 |               PC6 |<-------------    PB6       ACK^ (AVR open 3-state read and ack data was read after OBF^)
+ * A0      ------->| A0            PC7 |------------->    PB7       OBF^ (indicate to AVR data is available for reading)
+ * A1      ------->| A1                |
+ * A2      ------->| CS^               |
+ *                 |          PC0..PC2 |<------------>    PC0..PC2  FSEL0..FSEL2
+ * D0..D7  <------>| D0..D7   PB0..PB7 |<------------>    ???       n/a
+ *                 |                   |
+ *                 +-------------------+
+ *
+ * *  8255 Port A in 'Mode 2'
+ * ** INTP0 should be set to trigger on a low to high (rising edge) transition.
+ *
+ *
+ *  name:  FSEL2       FSEL1       FSEL0       ETH-CS^    LCD-CS^     LCD-D/C^     SD-CS^
+ *  8255:   PC2         PC1         PC0
+ *  AVR :   PC2         PC1         PC0         PC5         PC4         PC3        PB2/SS^
+ *       ---------   ---------   ---------   ----------  ----------  ----------  ------------
+ *           0           0           0           1           0           0            1        - LCD select command
+ *           0           0           1           1           0           1            1        - LCD select data
+ *           0           1           0           0           1           1            1        - Ethernet select - read
+ *           0           1           1           0           1           1            1        - Ethernet select - write
+ *           1           0           0           1           1           1            0        - SD Card select - read
+ *           1           0           1           1           1           1            0        - SD Card select - write
+ *           1           1           0           1           1           1            1        - Read AVR status
+ *           1           1           1           1           1           1            1        - Write AVR command
+ *
  */
 
 #include    <stdint.h>
@@ -69,31 +58,99 @@
 #include    <avr/io.h>
 #include    <avr/interrupt.h>
 #include    <avr/wdt.h>
+#include    <avr/cpufunc.h>
+#include    <util/delay_basic.h>
 
-// IO ports B, C and D initialization
-#define     PB_DDR_INIT     0xac    // port data direction (SS^ / PB2 pin defined as output even if not used! see sec 18.3.2 in spec sheet)
+// AVR IO ports B, C and D initialization
+
+/* -----------------------------------------------------------------------
+   Port B
+
+  +-----+-----+-----+-----+-----+-----+-----+-----+
+  | PB7 | PB6 | PB5 | PB4 | PB3 | PB2 | PB1 | PB0 |
+  +-----+-----+-----+-----+-----+-----+-----+-----+
+     |     |     |     |     |     |     |     |
+     |     |     |     |     |     |     |     |
+     |     |     |     |     |     |     |     +--- [o]  STB^ (AVR strobe data into 8255)
+     |     |     |     |     |     |     +--------- [i]  IBF  (8255 latched data, not ready = '1', ready or data read by CPU = '0')
+     |     |     |     |     |     +--------------- [o]  use SS^ for SD-Card select
+     |     |     |     |     +--------------------- [o]  MOSI
+     |     |     |     +--------------------------- [i]  MISO
+     |     |     +--------------------------------- [o]  SCLK
+     |     +--------------------------------------- [o]  ACK^ (AVR open 3-state read and ack data was read after OBF^)
+     +--------------------------------------------- [i]  OBF^ (indicate to AVR data is available for reading)
+
+----------------------------------------------------------------------- */
+#define     PB_DDR_INIT     0x6d    // port data direction
 #define     PB_PUP_INIT     0x00    // port input pin pull-up
-#define     PB_INIT         0x84    // port initial values
+#define     PB_INIT         0x45    // port initial values
 
+/* -----------------------------------------------------------------------
+   Port C
+
+  +-----+-----+-----+-----+-----+-----+-----+-----+
+  | xxx | PC6 | PC5 | PC4 | PC3 | PC2 | PC1 | PC0 |
+  +-----+-----+-----+-----+-----+-----+-----+-----+
+           |     |     |     |     |     |     |
+           |     |     |     |     |     |     |
+           |     |     |     |     |     |     +--- [i]  \
+           |     |     |     |     |     +--------- [i]   | 3-bit device select
+           |     |     |     |     +--------------- [i]  /
+           |     |     |     +--------------------- [o]  LCD Data/Control^
+           |     |     +--------------------------- [o]  LCD Select
+           |     +--------------------------------- [o]  Ethernet Select
+           +--------------------------------------- [i]  Reset
+
+----------------------------------------------------------------------- */
 #define     PC_DDR_INIT     0x38    // port data direction
 #define     PC_PUP_INIT     0x00    // port input pin pull-up
 #define     PC_INIT         0x38    // port initial values
 
+/* -----------------------------------------------------------------------
+   Port D
+
+  +-----+-----+-----+-----+-----+-----+-----+-----+
+  | PD7 | PC6 | PC5 | PC4 | PC3 | PC2 | PC1 | PC0 |
+  +-----+-----+-----+-----+-----+-----+-----+-----+
+     |     |     |     |     |     |     |     |
+     |     |     |     |     |     |     |     |
+     +-----+-----+-----+-----+-----+-----+-----+--- [i/o] data
+
+----------------------------------------------------------------------- */
 #define     PD_DDR_INIT     0x00    // port data direction
 #define     PD_PUP_INIT     0x00    // port input pin pull-up
 #define     PD_INIT         0x00    // port initial values
 
 // SPI configuration
-#define     SPI_CTRL        0x50    // SPI control register (per ST7735R and ENC28J60 data sheet CPOL and CPHA = 0, SPI mode o)
+#define     SPI_CTRL        0x52    // SPI control register (per ST7735R and ENC28J60 data sheet CPOL and CPHA = 0, SPI mode o)
+#define     SPI_STAT        0x00    // SPI2X flag at '0'
 #define     PWR_REDUCION    0xeb    // turn off unused peripherals: I2C, timers, UASRT, ADC
+#define     DUMMY_BYTE      0xff
 
 // misc masks and definitions
-#define     TOGG_RDY        0x80    // toggle PB7
-#define     PAR_WRITE       0x40    // detect read or write from v25 on PB6
-#define     V25_STROBE      0x01    // detect asserted strobe from v25 on PB0
-#define     CS_MASK         0xc7    // mask to clear CS bits before setting
+#define     AVR_SPI_SS      0x04    // for controlling PB2, AVR's SS^ line
+#define     SS_MASK         0x07    // Sale Select mask for selections coming from 8255 PC0..PC2
+#define     CS_MASK         0xc7    // mask to clear device select bit PC3/4/5
+#define     TOGG_ACK        0x40    // toggle ACK to 8255 on PB6
+#define     DET_OBF         0x80    // detect OBF from 8255 on PB7
+#define     TOGG_STB        0x01    // toggle STB to 8255 on PB0
+#define     DET_IBF         0x02    // detect IBF from 8255 on PB1
 #define     TX_DONE         0x80    // SPIF flag test
-#define     DUMMY_WR        0x00    // dummy data to write to slave when reading from it
+
+/****************************************************************************
+  type definitions
+****************************************************************************/
+typedef enum                                    // valid devices supported
+{
+    LCD_CMD,                                    // ST7735R LCD controller commands
+    LCD_DATA,                                   // ST7735R LCD controller data
+    ETHERNET_RD,                                // ENC28J60 Ethernet read
+    ETHERNET_WR,                                // ENC28J60 Ethernet write
+    SD_CARD_RD,                                 // SD card read
+    SD_CARD_WR,                                 // SD card write
+    AVR_CMD,                                    // special command to AVR
+    NONE                                        // nothing selected
+} spiDevice_t;
 
 /****************************************************************************
   special function prototypes
@@ -104,7 +161,7 @@ void reset(void) __attribute__((naked)) __attribute__((section(".init3")));
 /****************************************************************************
   Globals
 ****************************************************************************/
-uint8_t     deviceCS[4] = {0x18, 0x20, 0x28, 0x38}; // easy selection input: PC0..PC1 to output: PC3..PC4..PC5
+uint8_t     deviceCS[8] = {0x20, 0x28, 0x18, 0x18, 0x38, 0x38, 0x38, 0x38}; // easy selection input: PC0..PC1 to output: PC3..PC5
 
 /* ----------------------------------------------------------------------------
  * ioinit()
@@ -116,17 +173,17 @@ uint8_t     deviceCS[4] = {0x18, 0x20, 0x28, 0x38}; // easy selection input: PC0
 void ioinit(void)
 {
     // reconfigure system clock scaler to 8MHz
-    CLKPR = 0x80;   // change clock scaler (sec 8.12.2 p.37)
+    CLKPR = 0x82;   // change clock scaler (sec 8.12.2 p.37)
     CLKPR = 0x00;
 
     // power reduction setup
-    PRR   = PWR_REDUCION;
+    //PRR   = PWR_REDUCION;
 
     // initialize SPI interface for master mode
     SPCR  = SPI_CTRL;
+    SPSR  = SPI_STAT;
 
     // initialize general IO PB, PC and PD pins for output
-    // -
     DDRB  = PB_DDR_INIT;            // PB pin directions
     PORTB = PB_INIT | PB_PUP_INIT;  // initial value of pins and input with pull-up
 
@@ -135,6 +192,70 @@ void ioinit(void)
 
     DDRD   = PD_DDR_INIT;           // PD data direction
     PORTD  = PD_INIT | PD_PUP_INIT; // initial value of pins and input with pull-up
+}
+
+/* ----------------------------------------------------------------------------
+ * spiTxRx()
+ *
+ * send/receive byte on SPI
+ *
+ */
+uint8_t spiTxRx(uint8_t byte)
+{
+    SPDR = byte;                                // send byte on SPI
+    while ( !(SPSR & TX_DONE) ) {};             // and wait for transmission to complete
+    return SPDR;                                // return received byte
+}
+
+/* ----------------------------------------------------------------------------
+ * spi2par()
+ *
+ * read SPI device and transfer data to parallel interface
+ *
+ * 1. send dummy byte to clock data from salve
+ * 2. change PORT-D to output, write byte to PORTD
+ * 3. strobe STB^
+ * 4. change PORT-D back to input
+ * 5. wait for IBF == 'low' on PINB1
+ *
+ */
+void spi2par(void)
+{
+    PORTD = spiTxRx(DUMMY_BYTE);                // read SPI into Port-D
+                                                // this order of operations will ensure that 0's do not appear on Port-D pins when switching in to out direction
+    DDRD = 0xff;                                // switch PORT-D to output
+    PORTB &= ~TOGG_STB;                         // toggle STB^ to latch data into 8255, IBF is now 'hi'
+    _delay_loop_1(2);                           // stretch strobe pulse ~1uS
+    PORTB |= TOGG_STB;
+    DDRD = 0x00;                                // switch PORT-D back to input
+
+    while (PINB & DET_IBF) {};                  // wait for IBM to be "low", indicating read by 8255
+                                                // this will also sync with device select to do 1-byte read
+}
+
+/* ----------------------------------------------------------------------------
+ * par2spi()
+ *
+ * write data from the parallel interface to SPI device
+ *
+ * 1. wait for OBF^ == 'low' on PINB7
+ * 2. assert ACK^ = 'low', and read data from PIND
+ * 3. change ACK^ = 'hi'
+ * 4. send read data to SPI
+ *
+ */
+void par2spi(void)
+{
+    uint8_t     temp;
+
+    while (PINB & DET_OBF) {};                  // wait for OBF^ to be asserted ("low") by v25/8255
+
+    PORTB &= ~TOGG_ACK;                         // assert ("low") Ack on PB6,
+    _delay_loop_1(2);                           // stretch the ACK^ pulse ~1uS
+    temp = PIND;                                // to read byte from v25 on AVR PD
+    PORTB |= TOGG_ACK;                          // un-assert ("hi") Ack on PB6
+
+    spiTxRx(temp);
 }
 
 /* ----------------------------------------------------------------------------
@@ -159,80 +280,94 @@ void reset(void)
  * main() control functions
  *
  * - initialize IO: Ports and SPI
- * - wait for CS selection lines from v25 to change, and enter a "session"
- * - while in a "session"
- *      0. setup CS (SS lines) for devices on PC3,4,5
- *      1. configure PORT-D direction per RD^/WR line (PB6)
- *      2. wait for strobe to be asserted by v25 on PB0
- *      3. if in read mode send a dummy byte
- *         wait to transmission to finish by checking SPIF flag in SPSR register
- *         read returned byte and send it to PORT-D for v25 to read
- *      4. if in write mode read data from PORT-D and send through SPI
- *         place in SPI Tx register and wait to transmission to finish
- *      5. assert RDY and wait for strobe to un-assert
- *      6. when strobe is un-asserted, un-assert RDY
- * - clear data in the MISO circular buffer at the end of a session
- * - reset CS (SS lines) to devices)
- * - go back to wait for a CS selection to change
+ * - enter endless loop
+ *      1. assert CS selection lines according to v25 input on PINC0/1/2
+ *      2. select read or write action
+ *      3. for read
+ *         wait for IBF == 'low' on PINB1
+ *         send dummy byte to clock data from salve
+ *         change PORT-D to output, write byte to PORTD
+ *         strobe STB^
+ *         change PORT-D back to input
+ *      4. for write
+ *         wait for OBF^ == 'low' on PINB6
+ *         assert ACK^ = 'low', and read data from PIND
+ *         change ACK^ = 'hi'
+ *         send read data to SPI
  *
  */
 int main(void)
 {
-    int     nIsRead = 0;
     uint8_t temp;
+    uint8_t devSel;
 
-    // initialize peripherals
-    ioinit();
-    
-    // disable all interrupts
-    cli();
+    ioinit();									// initialize peripherals
+
+    cli();										// disable interrupts
 
     while (1)
     {
-        // wait for CS selection lines to change and indicate a device SS selection
-        while ( (PINC & 0x03) < 0x03 )
+        // setup device CS on P3/4/5 and SS^ (SS lines) according to
+        // inputs lines PC0/1/2
+        while ( (devSel = PINC & SS_MASK) == NONE ) // wait for a valid device selection
         {
-            // setup device CS (SS lines)
-            temp = (PORTC & CS_MASK) | deviceCS[(PINC & 0x03)];
-            PORTC = temp;
-
-            // configure PORT-D direction
-            if ( PINB & PAR_WRITE )
-            {
-                DDRD = 0x00;            // v25 writing, PORT-D is input
-                nIsRead = 0;
-            }
-            else
-            {
-                DDRD = 0xff;            // v25 reading, PORT-D is output
-                nIsRead = 1;
-            }
-
-            // wait for v25 to assert strobe *** potential lock up ***
-            while ( PINB & V25_STROBE ) {};
-
-            // handle v25 read or write
-            if ( nIsRead )
-            {
-                SPDR = DUMMY_WR;        // send a dummy byte
-                while ( ~(SPSR & TX_DONE) ) {}; // wait for transmission to complete
-                PORTD = SPDR;           // transfer the data byte to v25
-                PORTB ^= TOGG_RDY;      // assert RDY to v25
-            }
-            else
-            {
-                PORTB ^= TOGG_RDY;      // assert RDY to v25, also enabling tri-state buffer
-                SPDR = PIND;            // read data from v25 and transmit to slave
-                while ( ~(SPSR & TX_DONE) ) {}; // wait for transmission to complete
-            }
-
-            // wait for v25 to un-assert strobe before un-asserting RDY *** potential lock up ***
-            while ( ~(PINB & V25_STROBE) ) {};
-            PORTB ^= TOGG_RDY;          // *** to prevent race a condition, v25 should wait until RDY is un-asserted before continuing ***
+            PORTC |= ~CS_MASK;
+            PORTB |= AVR_SPI_SS;
         }
 
-        // un-assert all CS lines
-        PORTC |= ~CS_MASK;
+        // due to 8255 IO bit out settling time, recheck devSel
+        _delay_loop_1(4);                       // wait ~2uS and read PINC again
+        if (devSel != (PINC & SS_MASK) )        // does new read does not match first read?
+            continue;                           // if not abort here
+
+        switch ( devSel )
+        {
+        case LCD_CMD:
+        case LCD_DATA:
+            PORTB |= AVR_SPI_SS;
+            temp = ((PORTC & CS_MASK) | deviceCS[devSel]);
+            PORTC = temp;
+            break;
+
+        case ETHERNET_RD:                        // handle device selects from PC3/4/5
+        case ETHERNET_WR:
+            PORTB |= AVR_SPI_SS;
+            temp = ((PORTC & CS_MASK) | deviceCS[devSel]);
+            PORTC = temp;
+            break;
+
+        case SD_CARD_RD:                        // special handling for SD card (SS^ line on PB2)
+        case SD_CARD_WR:
+            temp = ((PORTC & CS_MASK) | deviceCS[devSel]);
+            PORTC = temp;
+            PORTB &= ~AVR_SPI_SS;
+            break;
+
+        case AVR_CMD:                           // a command into AVR, un-assert all select lines
+            PORTC |= ~CS_MASK;
+            PORTB |= AVR_SPI_SS;
+            break;
+        }
+
+        // handle reads and writes separately
+        // for reads send a dummy write and strobe the 8255 with data from slave
+        // for writes, get data from 8255 and shift to slave
+        switch ( devSel )
+        {
+        case LCD_CMD:
+        case LCD_DATA:
+        case ETHERNET_WR:
+        case SD_CARD_WR:
+            par2spi();                          // transfer byte from parallel port to SPI
+            break;
+
+        case ETHERNET_RD:
+        case SD_CARD_RD:
+            spi2par();                          // transfer data from SPI to parallel port
+            break;
+
+        default:;                               // for devSel == AVR_CMD
+        }
     }
 
     return 0;

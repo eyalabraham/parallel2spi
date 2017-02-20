@@ -19,8 +19,8 @@
  *                 |                   |  --------------
  *                 |       8255*       |   PA   0xXXX0
  *                 |                   |   PB   0xXXX1
- * INTP0** <-------| PC3               |   PC   0xXXX2
- * (P1.1)          |                   |   Ctrl 0xXXX3
+ * DMARQ0** <------| PC3               |   PC   0xXXX2
+ * (P2.0)          |                   |   Ctrl 0xXXX3
  *                 |                   |
  * IORD^   ------->| RD^      PA0..PA7 |<------------>    PD0..PD7  Data
  *                 |               PC4 |<-------------    PB0       STB^ (AVR strobe data into 8255)
@@ -29,17 +29,16 @@
  * A0      ------->| A0            PC7 |------------->    PB7       OBF^ (indicate to AVR data is available for reading)
  * A1      ------->| A1                |
  * A2      ------->| CS^               |
- *                 |          PC0..PC2 |<------------>    PC0..PC2  FSEL0..FSEL2
- * D0..D7  <------>| D0..D7   PB0..PB7 |<------------>    ???       n/a
+ *                 |          PC0..PC2 |<------------>    n.c.
+ * D0..D7  <------>| D0..D7   PB0..PB7 |<------------>    PB0..PB2  FSEL0..FSEL2
  *                 |                   |
  *                 +-------------------+
  *
  * *  8255 Port A in 'Mode 2'
- * ** INTP0 should be set to trigger on a low to high (rising edge) transition.
  *
  *
  *  name:  FSEL2       FSEL1       FSEL0       ETH-CS^    LCD-CS^     LCD-D/C^     SD-CS^
- *  8255:   PC2         PC1         PC0
+ *  8255:   PB2         PB1         PB0
  *  AVR :   PC2         PC1         PC0         PC5         PC4         PC3        PB2/SS^
  *       ---------   ---------   ---------   ----------  ----------  ----------  ------------
  *           0           0           0           1           0           0            1        - LCD select command
@@ -53,13 +52,15 @@
  *
  */
 
+#define     F_CPU           2000000UL
+
 #include    <stdint.h>
 
 #include    <avr/io.h>
 #include    <avr/interrupt.h>
 #include    <avr/wdt.h>
 #include    <avr/cpufunc.h>
-#include    <util/delay_basic.h>
+#include    <util/delay.h>
 
 // AVR IO ports B, C and D initialization
 
@@ -122,8 +123,8 @@
 #define     PD_INIT         0x00    // port initial values
 
 // SPI configuration
-#define     SPI_CTRL        0x52    // SPI control register (per ST7735R and ENC28J60 data sheet CPOL and CPHA = 0, SPI mode o)
-#define     SPI_STAT        0x00    // SPI2X flag at '0'
+#define     SPI_CTRL        0x51    // SPI control register (per ST7735R and ENC28J60 data sheet CPOL and CPHA = 0, SPI mode o)
+#define     SPI_STAT        0x01    // SPI2X flag at '1' -->  SCK=Fosc/8
 #define     PWR_REDUCION    0xeb    // turn off unused peripherals: I2C, timers, UASRT, ADC
 #define     DUMMY_BYTE      0xff
 
@@ -161,7 +162,7 @@ void reset(void) __attribute__((naked)) __attribute__((section(".init3")));
 /****************************************************************************
   Globals
 ****************************************************************************/
-uint8_t     deviceCS[8] = {0x20, 0x28, 0x18, 0x18, 0x38, 0x38, 0x38, 0x38}; // easy selection input: PC0..PC1 to output: PC3..PC5
+uint8_t     deviceCS[8] = {0x20, 0x28, 0x18, 0x18, 0x38, 0x38, 0x38, 0x38}; // easy selection input: PC0..PC2 to output: PC3..PC5
 
 /* ----------------------------------------------------------------------------
  * ioinit()
@@ -225,7 +226,7 @@ void spi2par(void)
                                                 // this order of operations will ensure that 0's do not appear on Port-D pins when switching in to out direction
     DDRD = 0xff;                                // switch PORT-D to output
     PORTB &= ~TOGG_STB;                         // toggle STB^ to latch data into 8255, IBF is now 'hi'
-    _delay_loop_1(2);                           // stretch strobe pulse ~1uS
+    _delay_us(1);                               // stretch strobe pulse ~1uS
     PORTB |= TOGG_STB;
     DDRD = 0x00;                                // switch PORT-D back to input
 
@@ -248,10 +249,14 @@ void par2spi(void)
 {
     uint8_t     temp;
 
-    while (PINB & DET_OBF) {};                  // wait for OBF^ to be asserted ("low") by v25/8255
+    while (PINB & DET_OBF)                      // wait for OBF^ to be asserted ("low") by v25/8255
+    {
+        if ( (PINC & SS_MASK) == NONE )         // because NEC v25 CPU is slower, AVR might wait here for OBF^ which will never assert
+            return;                             // the test of device selects here will facilitate aborting an SPI write cycle
+    }
 
     PORTB &= ~TOGG_ACK;                         // assert ("low") Ack on PB6,
-    _delay_loop_1(2);                           // stretch the ACK^ pulse ~1uS
+    _delay_us(1);                               // stretch the ACK^ pulse ~1uS
     temp = PIND;                                // to read byte from v25 on AVR PD
     PORTB |= TOGG_ACK;                          // un-assert ("hi") Ack on PB6
 
@@ -316,7 +321,7 @@ int main(void)
         }
 
         // due to 8255 IO bit out settling time, recheck devSel
-        _delay_loop_1(4);                       // wait ~2uS and read PINC again
+        _delay_us(4);                           // wait ~4uS and read PINC again
         if (devSel != (PINC & SS_MASK) )        // does new read does not match first read?
             continue;                           // if not abort here
 

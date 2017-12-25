@@ -123,7 +123,7 @@
 #define     PD_INIT         0x00    // port initial values
 
 // SPI configuration
-#define     SPI_CTRL        0x51    // SPI control register (per ST7735R and ENC28J60 data sheet CPOL and CPHA = 0, SPI mode o)
+#define     SPI_CTRL        0x53    // SPI control register (per ST7735R and ENC28J60 data sheet CPOL and CPHA = 0, SPI mode o)
 #define     SPI_STAT        0x01    // SPI2X flag at '1' -->  SCK=Fosc/8
 #define     PWR_REDUCION    0xeb    // turn off unused peripherals: I2C, timers, UASRT, ADC
 #define     DUMMY_BYTE      0xff
@@ -149,7 +149,7 @@ typedef enum                                    // valid devices supported
     ETHERNET_WR,                                // ENC28J60 Ethernet write
     SD_CARD_RD,                                 // SD card read
     SD_CARD_WR,                                 // SD card write
-    AVR_CMD,                                    // special command to AVR
+    KEEP_CS,                                    // leave last CS asserted
     NONE                                        // nothing selected
 } spiDevice_t;
 
@@ -230,7 +230,7 @@ void spi2par(void)
     PORTB |= TOGG_STB;
     DDRD = 0x00;                                // switch PORT-D back to input
 
-    while (PINB & DET_IBF) {};                  // wait for IBM to be "low", indicating read by 8255
+    while (PINB & DET_IBF) {};                  // wait for IBF to be "low", indicating read by 8255
                                                 // this will also sync with device select to do 1-byte read
 }
 
@@ -251,7 +251,9 @@ void par2spi(void)
 
     while (PINB & DET_OBF)                      // wait for OBF^ to be asserted ("low") by v25/8255
     {
-        if ( (PINC & SS_MASK) == NONE )         // because NEC v25 CPU is slower, AVR might wait here for OBF^ which will never assert
+        temp = (PINC & SS_MASK);
+        if ( temp == NONE ||                    // because NEC v25 CPU is slower, AVR might wait here for OBF^ which will never assert
+             temp == KEEP_CS )
             return;                             // the test of device selects here will facilitate aborting an SPI write cycle
     }
 
@@ -312,21 +314,26 @@ int main(void)
 
     while (1)
     {
-        // setup device CS on P3/4/5 and SS^ (SS lines) according to
-        // inputs lines PC0/1/2
-        while ( (devSel = PINC & SS_MASK) == NONE ) // wait for a valid device selection
-        {
-            PORTC |= ~CS_MASK;
-            PORTB |= AVR_SPI_SS;
-        }
-
         // due to 8255 IO bit out settling time, recheck devSel
-        _delay_us(4);                           // wait ~4uS and read PINC again
-        if (devSel != (PINC & SS_MASK) )        // does new read does not match first read?
-            continue;                           // if not abort here
+        devSel = PINC & SS_MASK;
+        _delay_us(2);                           // wait ~2uS and read PINC again
+        if (devSel != (PINC & SS_MASK) )        // does new read match first read?
+            continue;                           // if not exit here
 
+        // wait for a valid device selection
+        // then setup device CS on P3/4/5 and SS^ (SS lines) according to
+        // inputs lines PC0/1/2
         switch ( devSel )
         {
+        case NONE:                              // no selection, un-assert all CS lines
+            PORTC |= ~CS_MASK;                  // then fall through to continue waiting loop
+            PORTB |= AVR_SPI_SS;
+            /* no break */
+
+        case KEEP_CS:                           // leave previous CS line asserted and keep waiting for device selection
+            continue;
+            break;
+
         case LCD_CMD:
         case LCD_DATA:
             PORTB |= AVR_SPI_SS;
@@ -348,10 +355,7 @@ int main(void)
             PORTB &= ~AVR_SPI_SS;
             break;
 
-        case AVR_CMD:                           // a command into AVR, un-assert all select lines
-            PORTC |= ~CS_MASK;
-            PORTB |= AVR_SPI_SS;
-            break;
+        default:;                               // *** not a possible selection ***
         }
 
         // handle reads and writes separately
@@ -371,7 +375,7 @@ int main(void)
             spi2par();                          // transfer data from SPI to parallel port
             break;
 
-        default:;                               // for devSel == AVR_CMD
+        default:;                               // *** should not reach here *** fall through for devSel .eq. NONE or KEEP_CS
         }
     }
 
